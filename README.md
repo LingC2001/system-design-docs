@@ -1,6 +1,6 @@
 <img src="docs/public/logo-dark.png" width="25%">
 
-# Docs Template
+# System Design Documentation
 
 A minimal documentation site template built with [Fumadocs](https://fumadocs.dev/) and [Next.js](https://nextjs.org/), ready to deploy to GitHub Pages.
 
