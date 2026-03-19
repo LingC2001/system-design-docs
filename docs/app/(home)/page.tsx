@@ -5,12 +5,12 @@ export default function HomePage() {
     <div className="flex flex-col justify-center items-center flex-1 px-4 py-20">
       <div className="w-full max-w-3xl text-center space-y-6">
         <h1 className="text-5xl sm:text-6xl font-bold text-foreground leading-tight">
-          My Docs
+          System Design Docs
         </h1>
 
         <p className="text-base sm:text-lg text-gray-500 dark:text-gray-400 max-w-lg mx-auto">
-          A documentation site built with Fumadocs and Next.js, deployed to
-          GitHub Pages.
+          Concise references for common system design problems — covering
+          requirements, architecture, APIs, and deep dives.
         </p>
 
         <div className="flex flex-col sm:flex-row gap-4 justify-center pt-4">

@@ -1,0 +1,284 @@
+---
+title: "File Sharing System (Dropbox)"
+description: "Design a cloud-based file storage and sharing service like Dropbox that supports uploading, downloading, sharing, and syncing files across devices."
+---
+
+## Overview
+
+Design a cloud-based file storage service that allows users to store, share, and sync files across devices. Think Dropbox, Google Drive, or OneDrive.
+
+---
+
+## Functional Requirements
+
+1. **Upload** a file from any device
+2. **Download** a file from any device
+3. **Share** a file with other users and view shared files
+4. **Sync** files automatically across devices
+
+### Out of Scope
+
+- File editing or in-browser previewing
+- Designing Blob Storage itself
+
+---
+
+## Non-Functional Requirements
+
+1. **Highly available** — prioritize availability over consistency (it's okay if a newly uploaded file takes a few seconds to appear for other users)
+2. **Large file support** — files up to 50 GB
+3. **Secure and reliable** — encryption, access control, and recovery from data loss or corruption
+4. **Low latency** — fast uploads, downloads, and syncing
+
+### Out of Scope
+
+- Per-user storage limits
+- File versioning
+- Virus/malware scanning
+
+---
+
+## Core Entities
+
+| Entity | Description |
+| --- | --- |
+| **File** | The raw file data (bytes) stored in Blob Storage |
+| **FileMetadata** | Name, size, MIME type, owner, timestamps, chunk info |
+| **User** | An authenticated user of the system |
+
+---
+
+## API Design
+
+```python
+# Upload a file
+POST /files
+Request: { File, FileMetadata }
+
+# Download a file
+GET /files/{fileId} -> File & FileMetadata
+
+# Share a file
+POST /files/{fileId}/share
+Request: { User[] }
+
+# List files shared with the current user
+GET /files?shared=true
+
+# Get changes since last sync
+GET /files/changes?since={timestamp} -> ChangeEvent[]
+```
+
+User identity is passed via headers (session token or JWT) — never in the request body.
+
+---
+
+## High-Level Design
+
+### Architecture Components
+
+| Component | Role |
+| --- | --- |
+| **Client (Uploader/Downloader)** | Handles chunking, compression, local file monitoring, and sync |
+| **LB & API Gateway** | Routing, SSL termination, rate limiting, request validation |
+| **File Service** | Reads/writes metadata, generates presigned URLs (control plane only — never touches file bytes) |
+| **File Metadata DB** | Stores file metadata and share mappings (DynamoDB or PostgreSQL) |
+| **S3 (Blob Storage)** | Stores actual file data; clients upload/download directly via presigned URLs |
+| **CDN (e.g. CloudFront)** | Caches files at edge locations for faster downloads |
+
+### Metadata Schema
+
+```json
+{
+  "id": "123",
+  "name": "file.txt",
+  "size": 1000,
+  "mimeType": "text/plain",
+  "uploadedBy": "user1",
+  "uploadTimestamp": "2024-03-18T14:30:00Z",
+  "lastUpdated": "2024-04-18T14:30:00Z"
+}
+```
+
+---
+
+## Uploading Files
+
+Instead of routing file bytes through our servers, clients upload **directly to Blob Storage** using **presigned URLs**. This offloads large transfers from our backend.
+
+**Flow:**
+1. Client requests a presigned upload URL from the File Service
+2. File Service generates the URL (a local cryptographic operation — no call to S3)
+3. Client uploads directly to S3 using the presigned URL
+4. File Service stores/updates the metadata in the database
+
+---
+
+## Downloading Files
+
+Similarly, downloads go directly from Blob Storage to the client via presigned URLs.
+
+**Flow:**
+1. Client requests a presigned download URL: `GET /files/{fileId}/presigned-url`
+2. Client downloads the file directly from S3
+
+To reduce latency for geographically distributed users, serve downloads through a **CDN**. The File Service generates a CDN signed URL instead of a direct S3 URL. The CDN fetches from S3 on cache miss and serves from the edge on cache hit.
+
+> Note: For personal files shared among friends in the same region, CDN benefits may be limited and the cost may not be justified.
+
+---
+
+## Sharing Files
+
+Create a **SharedFiles** table to efficiently query which files are shared with a given user:
+
+| userId (Partition Key) | fileId (Sort Key) |
+| --- | --- |
+| user1 | fileId1 |
+| user1 | fileId2 |
+| user2 | fileId3 |
+
+When a user opens the app, query `SharedFiles` by their `userId` to get all shared files. This avoids maintaining a share list on every file metadata record.
+
+---
+
+## Syncing Across Devices
+
+### Local → Remote
+
+A **client-side sync agent** monitors the local Dropbox folder for changes using OS-level file system APIs (e.g. `FileSystemWatcher` on Windows, `FSEvents` on macOS). When changes are detected, the agent uploads the modified files and updates metadata via the upload API.
+
+### Remote → Local
+
+Use a **hybrid push/poll approach**:
+
+- **WebSocket/SSE connection** — the server pushes change notifications in real-time (one connection per device, not per file)
+- **Periodic polling as a safety net** — the client calls `GET /files/changes?since={timestamp}` every few minutes to catch anything missed during connection drops
+
+This gives near-instant sync with a reliable fallback guaranteeing no changes are lost.
+
+### Detecting Changes
+
+The client maintains a **last sync timestamp** (or version). On sync, it queries the server for all changes since that timestamp and downloads only what's needed.
+
+---
+
+## Deep Dive: Large File Uploads (Chunking)
+
+Single-request uploads break down for large files due to timeouts, payload size limits (e.g. API Gateway's 10 MB limit), and poor UX (no progress, no resume).
+
+### Chunked Uploads
+
+Split files into **5–10 MB chunks** on the client, then upload each chunk individually (or in parallel). This enables:
+
+- **Progress indicators** — track per-chunk completion
+- **Resumable uploads** — if the connection drops, only re-upload the remaining chunks
+- **Parallel transfers** — maximize available bandwidth
+
+### Fingerprinting
+
+Use a cryptographic hash (e.g. SHA-256) of each chunk's content as its unique ID. This allows:
+
+- Checking which chunks have already been uploaded on resume
+- File-level deduplication (same content → same fingerprint)
+
+> The file fingerprint identifies content, not the record. Two users uploading the same file produce the same fingerprint. Use a separate UUID as the `fileId` in metadata.
+
+### Tracking Chunk Status
+
+Update the metadata schema to track chunks:
+
+```json
+{
+  "id": "123",
+  "name": "large-file.zip",
+  "status": "uploading",
+  "chunks": [
+    { "id": "chunk1", "status": "uploaded" },
+    { "id": "chunk2", "status": "uploading" },
+    { "id": "chunk3", "status": "not-uploaded" }
+  ]
+}
+```
+
+**Two approaches to keeping chunk status in sync:**
+
+1. **Client confirms + server verifies ("trust but verify")** — client reports a chunk is uploaded, server checks with S3's `ListParts` API before marking it complete
+2. **S3 event notifications** — S3 notifies the server when uploads complete. However, S3 only fires notifications when the *entire* multipart upload completes, not per-part, so this doesn't work well for tracking individual chunks
+
+### End-to-End Chunked Upload Flow
+
+1. Client chunks the file and computes fingerprints for each chunk (and the whole file)
+2. Client checks if a file with the same fingerprint already exists and is mid-upload → resume
+3. If new, client calls the backend to initiate a multipart upload → backend calls S3 `CreateMultipartUpload`, saves metadata with status `"uploading"`, returns presigned URLs per chunk
+4. Client uploads each chunk to S3 using its presigned URL, then sends a `PATCH` to the backend with the chunk status and ETag. Backend verifies with S3 `ListParts` before updating metadata
+5. Once all chunks are uploaded, backend calls S3 `CompleteMultipartUpload` to assemble the file, then marks metadata as `"uploaded"`
+
+### Downloads of Chunked Files
+
+Once `CompleteMultipartUpload` is called, S3 assembles all parts into a single object. Downloads work normally — no chunk awareness needed. For very large files, HTTP **Range requests** allow parallel downloading of byte ranges or resuming interrupted downloads.
+
+---
+
+## Deep Dive: Low Latency Optimization
+
+### Parallel Chunk Transfers
+
+Chunking lets us upload/download multiple chunks in parallel, maximizing bandwidth utilization.
+
+### Delta Sync
+
+Only sync the chunks that changed, not the entire file. Use **Content-Defined Chunking (CDC)** with a rolling hash (e.g. Rabin fingerprinting) so that chunk boundaries are determined by file content. With fixed-size chunks, inserting a single byte shifts all subsequent boundaries and invalidates every chunk after the edit. CDC ensures only the chunks around the change are affected.
+
+### Compression
+
+Compress files on the client before uploading; decompress after downloading. This keeps our backend out of the data path.
+
+**Be smart about when to compress:**
+- **Text files** — high compression ratio, usually worth it (a 5 GB text file can compress to ~1 GB or less)
+- **Media files** (images, videos) — already compressed, minimal gains, net time increase from compress/decompress overhead
+
+The client should decide whether to compress based on file type, size, and network conditions.
+
+**Algorithm options:** Gzip (broadest support), Brotli (better ratios for text), Zstandard (best speed/ratio balance — strong choice for client-side compression).
+
+> Always compress *before* encrypting. Encryption introduces randomness that makes compression ineffective.
+
+### CDN for Downloads
+
+Cache popular files at edge locations close to users via a CDN like CloudFront, using CDN signed URLs.
+
+---
+
+## Deep Dive: Security
+
+### Encryption
+
+- **In transit** — HTTPS for all communication
+- **At rest** — enable S3 server-side encryption (S3 encrypts with a unique key, stored separately from the file)
+
+### Access Control
+
+The `SharedFiles` table acts as a basic ACL. Only generate download URLs for users who have access.
+
+### Signed URLs
+
+Presigned/signed URLs prevent unauthorized access even if a link is leaked:
+
+1. Server generates a signed URL with an expiration (e.g. 5 minutes), incorporating the URL path, expiry, and a cryptographic signature
+2. The URL is given to the authorized user
+3. CDN/S3 validates the signature and expiration on each request — serves content only if valid
+
+> Signed URLs are bearer tokens — anyone with an unexpired URL can access the file. Short TTLs limit exposure. For higher security, add IP binding or require authentication cookies alongside the URL.
+
+---
+
+## Key Takeaways
+
+- **Presigned URLs** let clients transfer files directly to/from Blob Storage, keeping the backend as a lightweight control plane
+- **Chunking** is essential for large files — enables resumability, progress tracking, and parallel transfers
+- **Fingerprinting** (hashing file/chunk content) enables deduplication and resumable uploads
+- **Content-Defined Chunking** makes delta sync efficient by keeping chunk boundaries stable across edits
+- **Hybrid push + poll** for syncing gives real-time updates with a reliable fallback
+- **Compress selectively** based on file type — don't waste cycles on already-compressed media
+- **Signed URLs with short TTLs** provide secure, time-limited access without exposing raw storage credentials

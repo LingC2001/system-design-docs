@@ -31,7 +31,7 @@ export function baseOptions(): BaseLayoutProps {
             className="hidden dark:block"
             unoptimized={true}
           />
-          My Docs
+          System Design Docs
         </div>
       ),
     },
