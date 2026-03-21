@@ -86,6 +86,32 @@ User identity is passed via headers (session token or JWT) — never in the requ
 | **S3 (Blob Storage)** | Stores actual file data; clients upload/download directly via presigned URLs |
 | **CDN (e.g. CloudFront)** | Caches files at edge locations for faster downloads |
 
+### Architecture Diagram
+
+```mermaid
+flowchart TD
+    Client["Client"]
+
+    subgraph control["Control Plane"]
+        LB["LB / API Gateway"]
+        FS["File Service"]
+        DB["Metadata DB"]
+    end
+
+    subgraph data["Data Plane"]
+        S3["S3 Blob Storage"]
+        CDN["CDN"]
+    end
+
+    Client -->|"1. request presigned URL"| LB
+    LB --> FS
+    FS <-->|"read / write metadata"| DB
+    FS -->|"2. return presigned URL"| Client
+    Client -->|"3. upload direct"| S3
+    Client -->|"download"| CDN
+    CDN -->|"cache miss"| S3
+```
+
 ### Metadata Schema
 
 ```json
